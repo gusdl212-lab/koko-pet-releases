@@ -1,0 +1,96 @@
+name: Check anonymous public 1.0.9 release integrity
+on:
+  push:
+    branches: [qa/public-direct109-20261101]
+permissions: {}
+jobs:
+  public-files:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - old: '1.0.6'
+            sha: '4404D34D02EAB0C6C90EE45AC91188A16CB8BF2D71B5218DB2FBA71BCEE9A570'
+          - old: '1.0.7'
+            sha: 'BB76F28A372C30A25B827A7E9ABC3AE3D1F2592F84C9A020540625031A7C859A'
+          - old: '1.0.8'
+            sha: '5C7C485A45B3E79EE78366D9633E791FECB9B9160B9F19604DA40F83123AFC27'
+    runs-on: windows-2025
+    timeout-minutes: 12
+    steps:
+      - name: Verify anonymous update feed, package and installer
+        shell: pwsh
+        run: |
+          $ErrorActionPreference='Stop'
+          $repo='https://github.com/gusdl212-lab/koko-pet-releases/releases'
+          $manifest=Invoke-RestMethod "$repo/latest/download/koko-direct-update.json" -TimeoutSec 60
+          $rsa=[Security.Cryptography.RSA]::Create()
+          try {
+            $read=0;$rsa.ImportSubjectPublicKeyInfo([Convert]::FromBase64String('MIIBojANBgkqhkiG9w0BAQEFAAOCAY8AMIIBigKCAYEA1FMki4cJ476c/3KPPnVfZQC25L9BeLQWcMQ6ckixG5CdfuBeV4DX2titKukYM5iB+m0HH8sqR+vohWAru4494fHu1O87Zdea36hLBZge22t4erjk+lwHnnDIlG93Dt9aJWwNpkXKHkvNqJG686AXnacE66vjApVdXq+orguGaNQM32ErmiF7HkUbXw6Z4up2S5sUZWpRGnKuqr+HG8vv++xKCH4xUayFhkFGyZLJRnYA5AdMMQfgDjZAGEfbXA4luVYiFWR0bGz3rMIYPRPM8aMr7tR+4m6C/s2d9y4cWDclZFW6KnmgmhhSIvFwWsS6ypAQ9bbecfLkBdMq72zWZwCATAAiLhN3OFGbL8gIUqBT5IcJUF8h6Ehao6TiLH/EcPG9omON6WiqjqoOQeoGWd1ncQgjeNtuC5fXUkRlAghzkDEXfWUUcsZ/42JDiePuhNbnKhIHyxtZxQ2xYgJxbsvPtCTcFtjg7BFC0oJ9bxOWmhzM29YlzcrN883+4w+1AgMBAAE='),[ref]$read)
+            $payload=[Convert]::FromBase64String($manifest.payload)
+            if(!$rsa.VerifyData($payload,[Convert]::FromBase64String($manifest.signature),[Security.Cryptography.HashAlgorithmName]::SHA256,[Security.Cryptography.RSASignaturePadding]::Pss)){throw 'Invalid update signature'}
+            $proof=[Text.Encoding]::UTF8.GetString($payload)|ConvertFrom-Json
+          }finally{$rsa.Dispose()}
+          $prefix="$repo/download/koko-pet-direct-v1.0.9"
+          if($proof.AppId -ne 'KokoPet.Direct' -or $proof.Channel -ne 'win' -or $proof.Version -ne '1.0.9' -or $proof.Url -cne "$prefix/KokoPet.Direct-1.0.9-full.nupkg"){throw 'Untrusted feed destination/version'}
+          'PASS anonymous latest feed verified with the previously embedded RSA-PSS public key'
+          foreach($file in @('KokoPet.Direct-1.0.9-full.nupkg','KokoPet.Direct-win-Setup.exe')){
+            $path=Join-Path $env:RUNNER_TEMP $file
+            Invoke-WebRequest "$prefix/$file" -OutFile $path -TimeoutSec 180
+            $hash=(Get-FileHash $path).Hash
+            if($file -eq $proof.FileName){if($hash -ne $proof.SHA256 -or (Get-Item $path).Length -ne $proof.Size){throw 'Public package hash/size failed'}}
+            elseif($hash -ne '9D6B443B079AB68D8C0EDA62E634C510BA72DCF80FE0970B2381F6A7FC6507BF'){throw 'Public installer hash failed'}
+            Write-Output "PASS public file $file, SHA-256 $hash"
+          }
+      - name: Install published 1.0.7 and accept its real update prompt
+        shell: pwsh
+        run: |
+          $ErrorActionPreference='Stop'
+          $base=Join-Path $env:LOCALAPPDATA KokoPet.Direct
+          if(Test-Path -LiteralPath $base){throw 'Require clean Windows VM'}
+          $old=Join-Path $env:RUNNER_TEMP 'setup107.exe'
+          Invoke-WebRequest 'https://github.com/gusdl212-lab/koko-pet-releases/releases/download/koko-pet-direct-v${{ matrix.old }}/KokoPet.Direct-win-Setup.exe' -OutFile $old -TimeoutSec 180
+          if((Get-FileHash $old).Hash -ne '${{ matrix.sha }}'){throw 'Bad baseline installer'}
+          $installer=Start-Process -FilePath $old -ArgumentList '--silent' -WindowStyle Hidden -Wait -PassThru
+          if($installer.ExitCode -ne 0){throw 'Install failed'}
+          $exe=Join-Path $base 'current/KOKO-PET-Direct.exe'
+          $dll=Join-Path $base 'current/KOKO-PET-Direct.dll'
+          if([Diagnostics.FileVersionInfo]::GetVersionInfo($dll).FileVersion -ne '${{ matrix.old }}.0'){throw 'Unexpected baseline'}
+          $running=Get-Process KOKO-PET-Direct -ErrorAction SilentlyContinue|Where-Object {$_.Path -eq $exe}
+          if(!$running){Start-Process -FilePath $exe -WindowStyle Hidden}
+          $uiFile=Join-Path $env:RUNNER_TEMP 'accept-update.ps1'
+          @'
+          $ErrorActionPreference='Stop'
+          Add-Type -AssemblyName UIAutomationTypes
+          Add-Type -AssemblyName UIAutomationClient
+          $auto=[System.Windows.Automation.AutomationElement]
+          $scope=[System.Windows.Automation.TreeScope]
+          $until=(Get-Date).AddSeconds(85)
+          do {
+           $windows=$auto::RootElement.FindAll($scope::Children,[System.Windows.Automation.PropertyCondition]::new($auto::NameProperty,'KOKO PET 업데이트'))
+           foreach($w in $windows){
+            $p=Get-Process -Id $w.Current.ProcessId -ErrorAction SilentlyContinue
+            if(!$p -or $p.Path -ne (Join-Path $env:LOCALAPPDATA 'KokoPet.Direct/current/KOKO-PET-Direct.exe')){continue}
+            $label=$w.FindFirst($scope::Descendants,[System.Windows.Automation.PropertyCondition]::new($auto::NameProperty,'새 버전 1.0.9이 준비됐어요!'))
+            $now=$w.FindFirst($scope::Descendants,[System.Windows.Automation.PropertyCondition]::new($auto::NameProperty,'지금 업데이트'))
+            if($label -and $now){$now.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern).Invoke();'PASS installed application offered public 1.0.9; consent given in normal UI';return}
+           }
+           Start-Sleep -Milliseconds 400
+          }while((Get-Date) -lt $until)
+          throw 'Public update prompt not seen'
+          '@ | Set-Content $uiFile -Encoding utf8BOM
+          & powershell.exe -NoProfile -NonInteractive -Sta -File $uiFile
+          if($LASTEXITCODE){throw 'Live update UI check failed'}
+          $until=(Get-Date).AddMinutes(2)
+          do {
+            $p=Get-Process KOKO-PET-Direct -ErrorAction SilentlyContinue |Where-Object {$_.Path -eq $exe}
+            if((Test-Path $dll) -and $p -and [Diagnostics.FileVersionInfo]::GetVersionInfo($dll).ProductVersion -eq '1.0.9+59c74dba1644cb94fed2e8e1dc14964ed8ca949e'){
+              $sid=[Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+              $pipe='KokoPet-characters-v1-'+$sid+'-'+[Diagnostics.Process]::GetCurrentProcess().SessionId+'-direct'
+              $c=[IO.Pipes.NamedPipeClientStream]::new('.',$pipe,[IO.Pipes.PipeDirection]::InOut)
+              try{$c.Connect(800);$bytes=[Text.Encoding]::UTF8.GetBytes('engine-version');$c.Write([BitConverter]::GetBytes([uint16]$bytes.Length));$c.Write($bytes);$c.Flush();$length=$c.ReadByte()+256*$c.ReadByte();if($length -gt 0 -and $length -le 16){$reply=[byte[]]::new($length);$c.ReadExactly($reply);if([Text.Encoding]::UTF8.GetString($reply) -eq '1.0.9'){'PASS actual public 1.0.7 to 1.0.9 update, relaunch and IPC';exit 0}}}catch{}finally{$c.Dispose()}
+            }
+            Start-Sleep -Milliseconds 500
+          }while((Get-Date) -lt $until)
+          throw 'Updated app did not respond'
+
