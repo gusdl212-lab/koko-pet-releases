@@ -20,8 +20,8 @@ jobs:
           $ErrorActionPreference='Stop'
           $headers=@{Authorization="Bearer $env:QA_TOKEN";Accept='application/octet-stream';'User-Agent'='koko-candidate-qa'}
           $file=Join-Path $env:RUNNER_TEMP input.zip
-          Invoke-WebRequest 'https://api.github.com/repos/gusdl212-lab/koko-pet-releases/releases/assets/696864871' -Headers $headers -OutFile $file -TimeoutSec 180
-          if((Get-FileHash $file).Hash -ne '9e16a41ea872d4246dba98dc402343507fe5baf2bca288048d1139e4e2f89335'){throw 'QA input mismatch'}
+          Invoke-WebRequest 'https://api.github.com/repos/gusdl212-lab/koko-pet-releases/releases/assets/696868568' -Headers $headers -OutFile $file -TimeoutSec 180
+          if((Get-FileHash $file).Hash -ne '11a174ba4004bf99a08f9971897dd88302ccabcf1e2797acae08609e87222b55'){throw 'QA input mismatch'}
           [IO.Compression.ZipFile]::ExtractToDirectory($file,(Join-Path $env:RUNNER_TEMP payload))
       - name: Build, install, upgrade and verify the candidate
         shell: pwsh
