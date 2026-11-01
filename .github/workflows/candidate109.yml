@@ -1,0 +1,85 @@
+name: Check nonpublic Windows candidate
+on:
+  push:
+    branches: [qa/check-direct109-20261101]
+permissions:
+  contents: write
+jobs:
+  clean-windows:
+    runs-on: windows-2025
+    timeout-minutes: 18
+    steps:
+      - uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9
+        with:
+          dotnet-version: '10.0.x'
+      - name: Fetch verified build input
+        shell: pwsh
+        env:
+          QA_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference='Stop'
+          $headers=@{Authorization="Bearer $env:QA_TOKEN";Accept='application/octet-stream';'User-Agent'='koko-candidate-qa'}
+          $file=Join-Path $env:RUNNER_TEMP input.zip
+          Invoke-WebRequest 'https://api.github.com/repos/gusdl212-lab/koko-pet-releases/releases/assets/696864871' -Headers $headers -OutFile $file -TimeoutSec 180
+          if((Get-FileHash $file).Hash -ne '9e16a41ea872d4246dba98dc402343507fe5baf2bca288048d1139e4e2f89335'){throw 'QA input mismatch'}
+          [IO.Compression.ZipFile]::ExtractToDirectory($file,(Join-Path $env:RUNNER_TEMP payload))
+      - name: Build, install, upgrade and verify the candidate
+        shell: pwsh
+        run: |
+          $ErrorActionPreference='Stop'
+          $payload=Join-Path $env:RUNNER_TEMP payload
+          & (Join-Path $payload 'build-on-windows.ps1') -Payload $payload -Result (Join-Path $env:RUNNER_TEMP result)
+      - name: Return only the two verified binaries to the authenticated draft
+        shell: pwsh
+        env:
+          QA_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference='Stop'
+          $h=@{Authorization="Bearer $env:QA_TOKEN";Accept='application/vnd.github+json';'User-Agent'='koko-candidate-qa'}
+          $r=Invoke-RestMethod 'https://api.github.com/repos/gusdl212-lab/koko-pet-releases/releases/430270878' -Headers $h
+          if(!$r.draft -or $r.tag_name -ne 'qa-direct109-59c74db-20261101'){throw 'Authenticated QA draft required'}
+          foreach($name in @('KokoPet.Direct-win-Setup.exe','KokoPet.Direct-1.0.9-full.nupkg')){
+            $path=Join-Path (Join-Path $env:RUNNER_TEMP result) $name
+            $asset=Invoke-RestMethod "https://uploads.github.com/repos/gusdl212-lab/koko-pet-releases/releases/430270878/assets?name=$name" -Headers $h -Method Post -InFile $path -ContentType 'application/octet-stream' -TimeoutSec 240
+            if($asset.digest -ne ('sha256:'+(Get-FileHash $path).Hash.ToLowerInvariant())){throw 'Artifact mismatch'}
+            Write-Output "PASS $name $($asset.digest)"
+          }
+  fresh-install:
+    needs: clean-windows
+    runs-on: windows-2025
+    timeout-minutes: 6
+    steps:
+      - name: Install and start the same candidate on another clean desktop
+        shell: pwsh
+        env:
+          QA_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference='Stop'
+          $h=@{Authorization="Bearer $env:QA_TOKEN";Accept='application/vnd.github+json';'User-Agent'='koko-candidate-qa'}
+          $draft=Invoke-RestMethod 'https://api.github.com/repos/gusdl212-lab/koko-pet-releases/releases/430270878' -Headers $h
+          if(!$draft.draft -or $draft.tag_name -ne 'qa-direct109-59c74db-20261101'){throw 'Expected QA draft'}
+          $asset=$draft.assets|Where-Object name -ceq 'KokoPet.Direct-win-Setup.exe'
+          if(!$asset -or $asset.state -ne 'uploaded'){throw 'Verified installer missing'}
+          $h.Accept='application/octet-stream';$file=Join-Path $env:RUNNER_TEMP 'setup108.exe'
+          Invoke-WebRequest $asset.url -Headers $h -OutFile $file -TimeoutSec 180
+          if(('sha256:'+(Get-FileHash $file).Hash.ToLowerInvariant()) -ne $asset.digest){throw 'Downloaded installer differs'}
+          $root=Join-Path $env:LOCALAPPDATA 'KokoPet.Direct'
+          if(Test-Path -LiteralPath $root){throw 'Fresh install expected'}
+          $install=Start-Process -FilePath $file -ArgumentList '--silent' -WindowStyle Hidden -Wait -PassThru
+          if($install.ExitCode -ne 0){throw 'Installer failed'}
+          $exe=Join-Path $root 'current/KOKO-PET-Direct.exe';$dll=Join-Path $root 'current/KOKO-PET-Direct.dll'
+          if([Diagnostics.FileVersionInfo]::GetVersionInfo($dll).ProductVersion -ne '1.0.9+59c74dba1644cb94fed2e8e1dc14964ed8ca949e'){throw 'Wrong installed build'}
+          Start-Process -FilePath $exe -ArgumentList '--startup' -WindowStyle Hidden
+          $sid=[Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+          $pipe='KokoPet-characters-v1-'+$sid+'-'+[Diagnostics.Process]::GetCurrentProcess().SessionId+'-direct'
+          $ok=$false
+          for($n=0;$n -lt 60 -and !$ok;$n++){
+           $c=[IO.Pipes.NamedPipeClientStream]::new('.',$pipe,[IO.Pipes.PipeDirection]::InOut)
+           try{$c.Connect(450);$b=[Text.Encoding]::UTF8.GetBytes('engine-version');$c.Write([BitConverter]::GetBytes([uint16]$b.Length));$c.Write($b);$c.Flush();$nBytes=$c.ReadByte()+256*$c.ReadByte();if($nBytes -gt 0 -and $nBytes -lt 16){$bytes=[byte[]]::new($nBytes);$c.ReadExactly($bytes);$ok=[Text.Encoding]::UTF8.GetString($bytes) -eq '1.0.9'}}catch{}finally{$c.Dispose()};if(!$ok){Start-Sleep -Milliseconds 160}
+          }
+          if(!$ok){throw 'Fresh application did not respond'}
+          Get-Process KOKO-PET-Direct -ErrorAction SilentlyContinue|Where-Object {$_.Path -eq $exe}|ForEach-Object {Stop-Process -Id $_.Id;$_.WaitForExit(12000)|Out-Null}
+          $un=Start-Process -FilePath (Join-Path $root Update.exe) -ArgumentList '--silent','uninstall' -WindowStyle Hidden -Wait -PassThru
+          if($un.ExitCode -ne 0 -or (Test-Path -LiteralPath $dll)){throw 'Uninstall failed'}
+          'PASS verified candidate clean installed, app version responded and uninstalled on a separate Windows VM'
+
